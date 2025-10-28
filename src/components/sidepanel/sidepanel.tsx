@@ -998,6 +998,7 @@ GUIDELINES:
   // Stream with AI SDK using MCP tools
   const streamWithAISDKAndMCP = async (messages: Message[], tools: any) => {
     try {
+      console.log('Starting AI SDK stream with MCP tools');
       // Import streamText and provider SDKs
       const { streamText } = await import('ai');
       const { z } = await import('zod');
@@ -1012,6 +1013,7 @@ GUIDELINES:
         role: m.role,
         content: m.content
       }));
+      console.log('Converted messages:', aiMessages.length, 'messages');
 
       // Define browser history tool
       const browserHistoryTool = {
@@ -1025,17 +1027,17 @@ GUIDELINES:
           execute: async ({ query = '', maxResults = 20, daysBack = 7 }: { query?: string; maxResults?: number; daysBack?: number }) => {
             const startTime = Date.now() - (daysBack * 24 * 60 * 60 * 1000);
             const result = await executeTool('getBrowserHistory', { query, maxResults, startTime });
-            
+
             // Format the history results for better readability
             if (result && result.history && Array.isArray(result.history)) {
               const formatted = result.history.map((item: any) => {
                 const lastVisit = item.lastVisitTime ? new Date(item.lastVisitTime).toLocaleString() : 'Unknown';
                 return `• **${item.title || 'Untitled'}**\n  ${item.url}\n  Last visited: ${lastVisit}`;
               }).join('\n\n');
-              
+
               return `Found ${result.history.length} recent pages:\n\n${formatted}`;
             }
-            
+
             return result;
           },
         },
@@ -1046,14 +1048,16 @@ GUIDELINES:
         ...tools,
         ...browserHistoryTool,
       };
+      console.log('Total tools available:', Object.keys(allTools).length);
 
-        const result = streamText({
-          model,
-          tools: allTools,
-          messages: aiMessages,
-          stopWhen: stepCountIs(20),
-          abortSignal: abortControllerRef.current?.signal,
-        });
+      const result = streamText({
+        model,
+        tools: allTools,
+        messages: aiMessages,
+        stopWhen: stepCountIs(20),
+        abortSignal: abortControllerRef.current?.signal,
+      });
+      console.log('StreamText initialized');
 
       // Add initial assistant message
       const assistantMessage: Message = {
@@ -1065,8 +1069,11 @@ GUIDELINES:
 
       // Stream the response - collect full text without duplicates
       let fullText = '';
+      let chunkCount = 0;
       for await (const chunk of result.textStream) {
+        chunkCount++;
         fullText += chunk;
+        console.log(`Received chunk ${chunkCount}, total length: ${fullText.length}`);
         setMessages(prev => {
           const updated = [...prev];
           const lastMsg = updated[updated.length - 1];
@@ -1077,9 +1084,12 @@ GUIDELINES:
           return updated;
         });
       }
+      console.log('Streaming completed, final text length:', fullText.length);
 
     } catch (error) {
       console.error('❌ Error streaming with AI SDK:', error);
+      console.error('Error name:', (error as any)?.name);
+      console.error('Error message:', (error as any)?.message);
       throw error;
     }
   };
@@ -1119,41 +1129,114 @@ GUIDELINES:
     );
 
     if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error?.message || 'Google API request failed');
+      const errorData = await response.text();
+      let errorMessage = 'Google API request failed';
+      try {
+        const errorJson = JSON.parse(errorData);
+        errorMessage = errorJson.error?.message || errorMessage;
+      } catch (e) {
+        errorMessage += `: ${errorData}`;
+      }
+      throw new Error(errorMessage);
     }
 
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let fullText = '';
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
-        try {
-          const json = JSON.parse(line);
-          const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (text) {
-            setMessages(prev => {
-              const updated = [...prev];
-              const lastMsg = updated[updated.length - 1];
-              if (lastMsg && lastMsg.role === 'assistant') {
-                lastMsg.content += text;
-              }
-              return updated;
-            });
-          }
-        } catch (e) {
-          // Skip invalid JSON
+    try {
+      while (true) {
+        if (signal.aborted) {
+          throw new Error('Stream aborted by user');
         }
+
+        const { done, value } = await reader.read();
+        if (done) {
+          console.log('Stream ended normally');
+          break;
+        }
+
+        // Accumulate data
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process complete JSON objects from buffer
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete part
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine) continue;
+
+          // Skip empty lines or SSE data prefix if present
+          if (trimmedLine.startsWith('data: ')) {
+            const jsonStr = trimmedLine.slice(6); // Remove 'data: ' prefix
+            if (jsonStr === '[DONE]') continue;
+
+            try {
+              const json = JSON.parse(jsonStr);
+              console.log('Parsed chunk:', json);
+
+              // Extract text content
+              const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+              if (text) {
+                fullText += text;
+                setMessages(prev => {
+                  const updated = [...prev];
+                  const lastMsg = updated[updated.length - 1];
+                  if (lastMsg && lastMsg.role === 'assistant') {
+                    lastMsg.content = fullText;
+                  }
+                  return updated;
+                });
+              }
+
+              // Check for finish reason
+              const finishReason = json.candidates?.[0]?.finishReason;
+              if (finishReason) {
+                console.log('Stream finished with reason:', finishReason);
+                return; // Normal completion
+              }
+            } catch (parseError) {
+              console.warn('Failed to parse JSON line:', jsonStr, parseError);
+              // Try without 'data: ' if it failed
+              try {
+                const json = JSON.parse(trimmedLine);
+                console.log('Parsed as direct JSON:', json);
+
+                const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (text) {
+                  fullText += text;
+                  setMessages(prev => {
+                    const updated = [...prev];
+                    const lastMsg = updated[updated.length - 1];
+                    if (lastMsg && lastMsg.role === 'assistant') {
+                      lastMsg.content = fullText;
+                    }
+                    return updated;
+                  });
+                }
+
+                const finishReason = json.candidates?.[0]?.finishReason;
+                if (finishReason) {
+                  console.log('Stream finished with reason:', finishReason);
+                  return;
+                }
+              } catch (fallbackError) {
+                console.warn('Failed fallback parse:', trimmedLine, fallbackError);
+              }
+            }
+          }
+        }
+      }
+    } catch (streamError) {
+      console.error('Stream processing error:', streamError);
+      throw streamError;
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch (e) {
+        // ignore
       }
     }
   };
